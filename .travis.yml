@@ -1,10 +1,15 @@
 language: java
-jdk:
-  - oraclejdk8
 sudo: required
 cache:
   directories:
     - $HOME/.m2
+before_install:
+  - curl -fsSL -o /tmp/jdk8.tar.gz https://github.com/adoptium/temurin8-binaries/releases/download/jdk8u402-b06/OpenJDK8U-jdk_x64_linux_hotspot_8u402b06.tar.gz
+  - mkdir -p $HOME/seal-jdk && tar xzf /tmp/jdk8.tar.gz -C $HOME/seal-jdk --strip-components=1
+  - export JAVA_HOME=$HOME/seal-jdk
+  - export PATH=$JAVA_HOME/bin:$PATH
+  - java -version
 install: true
-before_script: travis_wait 45 ./mvnw install -q -U -DskipTests=true -Dmaven.test.redirectTestOutputToFile=true
-script: ./mvnw install -q -nsu -Dmaven.test.redirectTestOutputToFile=true
+script: ./mvnw -B install -U -Pstrict -Dmaven.test.redirectTestOutputToFile=true -Dmaven.javadoc.skip=true -Dgpg.skip=true
+after_script:
+  - python3 -c "import glob,xml.etree.ElementTree as E;t=[c for f in sorted(glob.glob('target/surefire-reports/TEST-*.xml')) for c in E.parse(f).getroot().iter('testcase')];s=[c for c in t if c.find('skipped') is not None];print('SEAL TEST SUMMARY - %d testcases, %d skipped' % (len(t),len(s)));[print('SKIPPED %s#%s - %s' % (c.get('classname'),c.get('name'),c.find('skipped').get('message'))) for c in s]"

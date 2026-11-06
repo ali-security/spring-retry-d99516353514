@@ -23,7 +23,10 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 import org.junit.Test;
 import org.springframework.retry.ExhaustedRetryException;
@@ -34,6 +37,7 @@ import org.springframework.retry.RetryState;
 import org.springframework.retry.backoff.ExponentialBackOffPolicy;
 import org.springframework.retry.support.DefaultRetryState;
 import org.springframework.retry.support.RetryTemplate;
+import org.springframework.util.SerializationUtils;
 
 /**
  * @author Dave Syer
@@ -227,6 +231,39 @@ public class StatefulRetryIntegrationTests {
 			}
 			return "bar";
 		}
+	}
+
+	static class SerializedMapRetryContextCache implements RetryContextCache {
+
+		private final Map<Object, byte[]> map = Collections
+				.synchronizedMap(new LinkedHashMap<Object, byte[]>(MapRetryContextCache.DEFAULT_CAPACITY, 0.75f, true) {
+					@Override
+					protected boolean removeEldestEntry(Map.Entry<Object, byte[]> eldest) {
+						return size() > MapRetryContextCache.DEFAULT_CAPACITY;
+					}
+				});
+
+		@Override
+		public boolean containsKey(Object key) {
+			return this.map.containsKey(key);
+		}
+
+		@Override
+		public RetryContext get(Object key) {
+			byte[] bytes = this.map.get(key);
+			return (bytes != null) ? (RetryContext) SerializationUtils.deserialize(bytes) : null;
+		}
+
+		@Override
+		public void put(Object key, RetryContext context) {
+			this.map.put(key, SerializationUtils.serialize(context));
+		}
+
+		@Override
+		public void remove(Object key) {
+			this.map.remove(key);
+		}
+
 	}
 
 }

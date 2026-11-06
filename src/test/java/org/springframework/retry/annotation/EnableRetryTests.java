@@ -33,12 +33,16 @@ import org.springframework.context.support.PropertySourcesPlaceholderConfigurer;
 import org.springframework.retry.backoff.ExponentialBackOffPolicy;
 import org.springframework.retry.backoff.Sleeper;
 import org.springframework.retry.interceptor.RetryInterceptorBuilder;
+import org.springframework.retry.policy.MapRetryContextCache;
+import org.springframework.retry.policy.RetryContextCache;
 import org.springframework.retry.policy.SimpleRetryPolicy;
 import org.springframework.retry.support.RetryTemplate;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNotSame;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -238,6 +242,80 @@ public class EnableRetryTests {
 		context.close();
 	}
 
+	@Test
+	public void testAdviceUsesQualifiedRetryContextCaches() {
+		AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext(
+				QualifiedRetryContextCachesConfiguration.class);
+		try {
+			DirectFieldAccessor directFieldAccessor = new DirectFieldAccessor(getAdvice(context));
+			assertSame(context.getBean("retryContextCache"),
+					directFieldAccessor.getPropertyValue("retryContextCache"));
+			assertSame(context.getBean("circuitBreakerRetryContextCache"),
+					directFieldAccessor.getPropertyValue("circuitBreakerRetryContextCache"));
+		}
+		finally {
+			context.close();
+		}
+	}
+
+	@Test
+	public void testAdviceUsesRetryContextCacheWhenSingleInstance() {
+		AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext(
+				SingleRetryContextCacheConfiguration.class);
+		try {
+			DirectFieldAccessor directFieldAccessor = new DirectFieldAccessor(getAdvice(context));
+			assertSame(context.getBean("customRetryContextCache"),
+					directFieldAccessor.getPropertyValue("retryContextCache"));
+			assertNotSame(context.getBean("customRetryContextCache"),
+					directFieldAccessor.getPropertyValue("circuitBreakerRetryContextCache"));
+		}
+		finally {
+			context.close();
+		}
+	}
+
+	@Test
+	public void statefulRetryCacheExhaustionDoesNotBlockCircuitBreakerOrNewItems() {
+		AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext(
+				CacheExhaustionConfiguration.class);
+		try {
+			UniqueKeyStatefulService service = context.getBean(UniqueKeyStatefulService.class);
+			// An attacker sends many unique failing requests that are never re-presented
+			for (int i = 0; i < MapRetryContextCache.DEFAULT_CAPACITY; i++) {
+				try {
+					service.service("attacker-" + i);
+					fail("Expected RuntimeException");
+				}
+				catch (RuntimeException e) {
+					assertEquals("Planned", e.getMessage());
+				}
+			}
+			// Circuit breakers in the application keep working
+			assertEquals("OK", service.circuit());
+			assertEquals(1, service.getCircuitCount());
+			// New stateful retries are still processed normally
+			for (int i = 0; i < 10; i++) {
+				try {
+					service.service("other-" + i);
+					fail("Expected RuntimeException");
+				}
+				catch (RuntimeException e) {
+					assertEquals("Planned", e.getMessage());
+				}
+			}
+			assertEquals(MapRetryContextCache.DEFAULT_CAPACITY + 10, service.getCount());
+		}
+		finally {
+			context.close();
+		}
+	}
+
+	private AnnotationAwareRetryOperationsInterceptor getAdvice(AnnotationConfigApplicationContext context) {
+		RetryConfiguration config = context.getBean(RetryConfiguration.class);
+		return (AnnotationAwareRetryOperationsInterceptor) new DirectFieldAccessor(config)
+				.getPropertyValue("advice");
+	}
+
 	private Object target(Object target) {
 		if (!AopUtils.isAopProxy(target)) {
 			return target;
@@ -360,6 +438,82 @@ public class EnableRetryTests {
 		@Bean
 		public NotAnnotatedInterface notAnnotatedInterface() {
 			return new RetryableImplementation();
+		}
+
+	}
+
+	@Configuration
+	@EnableRetry
+	protected static class QualifiedRetryContextCachesConfiguration {
+
+		@Bean
+		public RetryContextCache retryContextCache() {
+			return new MapRetryContextCache();
+		}
+
+		@Bean
+		public RetryContextCache circuitBreakerRetryContextCache() {
+			return new MapRetryContextCache();
+		}
+
+	}
+
+	@Configuration
+	@EnableRetry
+	protected static class SingleRetryContextCacheConfiguration {
+
+		@Bean
+		public RetryContextCache customRetryContextCache() {
+			return new MapRetryContextCache(1024, true);
+		}
+
+	}
+
+	@Configuration
+	@EnableRetry
+	protected static class CacheExhaustionConfiguration {
+
+		@SuppressWarnings("serial")
+		@Bean
+		public Sleeper sleeper() {
+			return new Sleeper() {
+				@Override
+				public void sleep(long period) throws InterruptedException {
+				}
+			};
+		}
+
+		@Bean
+		public UniqueKeyStatefulService uniqueKeyStatefulService() {
+			return new UniqueKeyStatefulService();
+		}
+
+	}
+
+	protected static class UniqueKeyStatefulService {
+
+		private int count = 0;
+
+		private int circuitCount = 0;
+
+		@Retryable(stateful = true)
+		public void service(String item) {
+			count++;
+			throw new RuntimeException("Planned");
+		}
+
+		@CircuitBreaker(RuntimeException.class)
+		public String circuit() {
+			circuitCount++;
+			return "OK";
+		}
+
+		public int getCount() {
+			return count;
+		}
+
+		public int getCircuitCount() {
+			return circuitCount;
 		}
 
 	}

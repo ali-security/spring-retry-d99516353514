@@ -36,6 +36,7 @@ import org.springframework.retry.RetryContext;
 import org.springframework.retry.RetryException;
 import org.springframework.retry.RetryPolicy;
 import org.springframework.retry.RetryState;
+import org.springframework.retry.policy.CircuitBreakerRetryPolicy;
 import org.springframework.retry.policy.MapRetryContextCache;
 import org.springframework.retry.policy.NeverRetryPolicy;
 import org.springframework.retry.policy.SimpleRetryPolicy;
@@ -223,8 +224,9 @@ public class StatefulRecoveryRetryTests {
 	@Test
 	public void testCacheCapacity() throws Throwable {
 
+		MapRetryContextCache cache = new MapRetryContextCache(1);
 		retryTemplate.setRetryPolicy(new SimpleRetryPolicy(1));
-		retryTemplate.setRetryContextCache(new MapRetryContextCache(1));
+		retryTemplate.setRetryContextCache(cache);
 
 		RetryCallback<Object, Exception> callback = new RetryCallback<Object, Exception>() {
 			public Object doWithRetry(RetryContext context) throws Exception {
@@ -243,12 +245,86 @@ public class StatefulRecoveryRetryTests {
 
 		try {
 			retryTemplate.execute(callback, new DefaultRetryState("bar"));
-			fail("Expected RetryException");
+			fail("Expected RuntimeException");
 		}
-		catch (RetryException e) {
-			String message = e.getMessage();
-			assertTrue("Message does not contain 'capacity': " + message, message.indexOf("capacity") >= 0);
+		catch (RuntimeException e) {
+			assertEquals("Barf!", e.getMessage());
 		}
+
+		assertTrue(cache.containsKey("bar"));
+		assertFalse(cache.containsKey("foo"));
+	}
+
+	@Test
+	public void testStatefulRetryNotBlockedWhenCacheIsFilledWithUniqueKeys() throws Throwable {
+
+		retryTemplate.setRetryPolicy(new SimpleRetryPolicy(3));
+
+		RetryCallback<Object, Exception> callback = new RetryCallback<Object, Exception>() {
+			public Object doWithRetry(RetryContext context) throws Exception {
+				count++;
+				throw new RuntimeException("Barf!");
+			}
+		};
+
+		// An attacker sends many unique failing items that are never re-presented
+		for (int i = 0; i < MapRetryContextCache.DEFAULT_CAPACITY + 10; i++) {
+			try {
+				retryTemplate.execute(callback, new DefaultRetryState("attacker-" + i));
+				fail("Expected RuntimeException");
+			}
+			catch (RuntimeException e) {
+				assertEquals("Barf!", e.getMessage());
+			}
+		}
+
+		// A legitimate item can still fail and be retried statefully
+		RetryState state = new DefaultRetryState("legitimate");
+		try {
+			retryTemplate.execute(callback, state);
+			fail("Expected RuntimeException");
+		}
+		catch (RuntimeException e) {
+			assertEquals("Barf!", e.getMessage());
+		}
+		RetryContext context = retryTemplate.open(new SimpleRetryPolicy(3), state);
+		assertEquals(1, context.getRetryCount());
+	}
+
+	@Test
+	public void testCircuitBreakerNotBlockedWhenStatefulRetryCacheIsFull() throws Throwable {
+
+		retryTemplate.setRetryPolicy(new SimpleRetryPolicy(3));
+
+		RetryCallback<Object, Exception> failingCallback = new RetryCallback<Object, Exception>() {
+			public Object doWithRetry(RetryContext context) throws Exception {
+				throw new RuntimeException("Barf!");
+			}
+		};
+
+		// An attacker fills the stateful retry cache with unique failing items
+		for (int i = 0; i < MapRetryContextCache.DEFAULT_CAPACITY; i++) {
+			try {
+				retryTemplate.execute(failingCallback, new DefaultRetryState("attacker-" + i));
+				fail("Expected RuntimeException");
+			}
+			catch (RuntimeException e) {
+				assertEquals("Barf!", e.getMessage());
+			}
+		}
+
+		// A circuit breaker using the same template must still be usable
+		retryTemplate.setRetryPolicy(new CircuitBreakerRetryPolicy(new SimpleRetryPolicy(3)));
+		RetryCallback<Object, Exception> callback = new RetryCallback<Object, Exception>() {
+			public Object doWithRetry(RetryContext context) throws Exception {
+				count++;
+				return "OK";
+			}
+		};
+		Object result = retryTemplate.execute(callback,
+				new DefaultRetryState("circuit", new BinaryExceptionClassifier(false)));
+		assertEquals("OK", result);
+		assertEquals(1, count);
 	}
 
 	@Test

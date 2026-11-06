@@ -1,5 +1,5 @@
 /*
- * Copyright 2006-2014 the original author or authors.
+ * Copyright 2006-2026 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -84,7 +84,7 @@ public class RetryTemplate implements RetryOperations {
 
 	private volatile RetryListener[] listeners = new RetryListener[0];
 
-	private RetryContextCache retryContextCache = new MapRetryContextCache();
+	private CompositeRetryContextCache retryContextCache = new CompositeRetryContextCache();
 
 	private boolean throwLastExceptionOnExhausted;
 
@@ -101,7 +101,17 @@ public class RetryTemplate implements RetryOperations {
 	 * @param retryContextCache the {@link RetryContextCache} to set.
 	 */
 	public void setRetryContextCache(RetryContextCache retryContextCache) {
-		this.retryContextCache = retryContextCache;
+		this.retryContextCache = this.retryContextCache.withStatefulCache(retryContextCache);
+	}
+
+	/**
+	 * Set the {@link RetryContextCache} to use for stateful retries that are used by
+	 * circuit breakers.
+	 *
+	 * @param circuitBreakerRetryContextCache the {@link RetryContextCache} to use
+	 */
+	public void setCircuitBreakerRetryContextCache(RetryContextCache circuitBreakerRetryContextCache) {
+		this.retryContextCache = this.retryContextCache.withCircuitBreakerCache(circuitBreakerRetryContextCache);
 	}
 
 	/**
@@ -388,9 +398,7 @@ public class RetryTemplate implements RetryOperations {
 			boolean succeeded) {
 		if (state != null) {
 			if (succeeded) {
-				if (!context.hasAttribute(GLOBAL_STATE)) {
-					this.retryContextCache.remove(state.getKey());
-				}
+				this.retryContextCache.remove(state.getKey(), context);
 				retryPolicy.close(context);
 				context.setAttribute(RetryContext.CLOSED, true);
 			}
@@ -412,7 +420,7 @@ public class RetryTemplate implements RetryOperations {
 			Object key = state.getKey();
 			if (key != null) {
 				if (context.getRetryCount() > 1
-						&& !this.retryContextCache.containsKey(key)) {
+						&& !this.retryContextCache.containsKey(key, context)) {
 					throw new RetryException(
 							"Inconsistent state for failed item key: cache key has changed. "
 									+ "Consider whether equals() or hashCode() for the key might be inconsistent, "
@@ -505,8 +513,8 @@ public class RetryTemplate implements RetryOperations {
 	protected <T> T handleRetryExhausted(RecoveryCallback<T> recoveryCallback,
 			RetryContext context, RetryState state) throws Throwable {
 		context.setAttribute(RetryContext.EXHAUSTED, true);
-		if (state != null && !context.hasAttribute(GLOBAL_STATE)) {
-			this.retryContextCache.remove(state.getKey());
+		if (state != null) {
+			this.retryContextCache.remove(state.getKey(), context);
 		}
 		if (recoveryCallback != null) {
 			T recovered = recoveryCallback.recover(context);
@@ -592,6 +600,70 @@ public class RetryTemplate implements RetryOperations {
 		else {
 			throw new RetryException("Exception in retry", throwable);
 		}
+	}
+
+	private static class CompositeRetryContextCache {
+
+		private final RetryContextCache statefulCache;
+
+		private final RetryContextCache circuitBreakerCache;
+
+		public CompositeRetryContextCache() {
+			this(new MapRetryContextCache(MapRetryContextCache.DEFAULT_CAPACITY, true),
+					new MapRetryContextCache(MapRetryContextCache.DEFAULT_CAPACITY, false));
+		}
+
+		private CompositeRetryContextCache(RetryContextCache statefulCache, RetryContextCache circuitBreakerCache) {
+			this.statefulCache = statefulCache;
+			this.circuitBreakerCache = circuitBreakerCache;
+		}
+
+		CompositeRetryContextCache withStatefulCache(RetryContextCache statefulCache) {
+			return new CompositeRetryContextCache(statefulCache, this.circuitBreakerCache);
+		}
+
+		CompositeRetryContextCache withCircuitBreakerCache(RetryContextCache circuitBreakerCache) {
+			return new CompositeRetryContextCache(this.statefulCache, circuitBreakerCache);
+		}
+
+		public RetryContext get(Object key) {
+			// only look up a cache that holds the key, as not all implementations
+			// support a lookup for a missing key
+			RetryContext retryContext = this.statefulCache.containsKey(key) ? this.statefulCache.get(key) : null;
+			if (retryContext == null && this.circuitBreakerCache.containsKey(key)) {
+				retryContext = this.circuitBreakerCache.get(key);
+			}
+			return retryContext;
+		}
+
+		public void put(Object key, RetryContext context) {
+			if (context.hasAttribute(GLOBAL_STATE)) {
+				this.circuitBreakerCache.put(key, context);
+			}
+			else {
+				this.statefulCache.put(key, context);
+			}
+		}
+
+		public void remove(Object key, RetryContext context) {
+			if (!context.hasAttribute(GLOBAL_STATE)) {
+				this.statefulCache.remove(key);
+			}
+		}
+
+		public boolean containsKey(Object key) {
+			return this.statefulCache.containsKey(key) || this.circuitBreakerCache.containsKey(key);
+		}
+
+		public boolean containsKey(Object key, RetryContext context) {
+			if (context.hasAttribute(GLOBAL_STATE)) {
+				return this.circuitBreakerCache.containsKey(key);
+			}
+			else {
+				return this.statefulCache.containsKey(key);
+			}
+		}
+
 	}
 
 }
